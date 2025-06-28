@@ -29,6 +29,7 @@ const defaultDomain string = ""
 // Role represents the data structure for a role in RBAC.
 type Role struct {
 	name                       string
+	isInheritTarget            bool
 	roles                      *sync.Map
 	users                      *sync.Map
 	matched                    *sync.Map
@@ -74,6 +75,10 @@ func (r *Role) addMatch(role *Role) {
 	role.matchedBy.Store(r.name, r)
 }
 
+func (r *Role) addMatchedBy(role *Role) {
+	r.matchedBy.Store(role.name, role)
+}
+
 func (r *Role) removeMatch(role *Role) {
 	r.matched.Delete(role.name)
 	role.matchedBy.Delete(r.name)
@@ -94,6 +99,7 @@ func (r *Role) rangeRoles(fn func(key, value interface{}) bool) {
 	r.roles.Range(fn)
 	r.roles.Range(func(key, value interface{}) bool {
 		role := value.(*Role)
+		role.isInheritTarget = true
 		role.matched.Range(fn)
 		return true
 	})
@@ -203,7 +209,6 @@ type RoleManagerImpl struct {
 	domainMatchingFunc rbac.MatchingFunc
 	logger             log.Logger
 	matchingFuncCache  *util.SyncLRUCache
-	mutex              sync.Mutex
 }
 
 // NewRoleManagerImpl is the constructor for creating an instance of the
@@ -350,21 +355,20 @@ func (rm *RoleManagerImpl) HasLink(name1 string, name2 string, domains ...string
 		return true, nil
 	}
 
-	// Lock to prevent race conditions between getRole and removeRole
-	rm.mutex.Lock()
-	defer rm.mutex.Unlock()
+	var user *Role
+	var ok bool
+	if user, ok = rm.load(name1); !ok {
+		user = newRole(name1)
 
-	user, userCreated := rm.getRole(name1)
-	role, roleCreated := rm.getRole(name2)
-
-	if userCreated {
-		defer rm.removeRole(user.name)
+		if rm.matchingFunc != nil {
+			rm.rangeMatchingRoles(user.name, false, func(r *Role) bool {
+				user.addMatchedBy(r)
+				return true
+			})
+		}
 	}
-	if roleCreated {
-		defer rm.removeRole(role.name)
-	}
 
-	return rm.hasLinkHelper(role.name, map[string]*Role{user.name: user}, rm.maxHierarchyLevel), nil
+	return rm.hasLinkHelper(name2, map[string]*Role{user.name: user}, rm.maxHierarchyLevel), nil
 }
 
 func (rm *RoleManagerImpl) hasLinkHelper(targetName string, roles map[string]*Role, level int) bool {
@@ -374,7 +378,10 @@ func (rm *RoleManagerImpl) hasLinkHelper(targetName string, roles map[string]*Ro
 
 	nextRoles := map[string]*Role{}
 	for _, role := range roles {
-		if targetName == role.name || (rm.matchingFunc != nil && rm.Match(role.name, targetName)) {
+		if targetName == role.name ||
+			(rm.matchingFunc != nil &&
+				(rm.Match(role.name, targetName) ||
+					(role.isInheritTarget && rm.Match(targetName, role.name)))) {
 			return true
 		}
 		role.rangeRoles(func(key, value interface{}) bool {
@@ -761,21 +768,20 @@ func (crm *ConditionalRoleManager) HasLink(name1 string, name2 string, domains .
 		return true, nil
 	}
 
-	// Lock to prevent race conditions between getRole and removeRole
-	crm.mutex.Lock()
-	defer crm.mutex.Unlock()
+	var user *Role
+	var ok bool
+	if user, ok = crm.load(name1); !ok {
+		user = newRole(name1)
 
-	user, userCreated := crm.getRole(name1)
-	role, roleCreated := crm.getRole(name2)
-
-	if userCreated {
-		defer crm.removeRole(user.name)
+		if crm.matchingFunc != nil {
+			crm.rangeMatchingRoles(user.name, false, func(r *Role) bool {
+				user.addMatchedBy(r)
+				return true
+			})
+		}
 	}
-	if roleCreated {
-		defer crm.removeRole(role.name)
-	}
 
-	return crm.hasLinkHelper(role.name, map[string]*Role{user.name: user}, crm.maxHierarchyLevel, domains...), nil
+	return crm.hasLinkHelper(name2, map[string]*Role{user.name: user}, crm.maxHierarchyLevel, domains...), nil
 }
 
 // hasLinkHelper use the Breadth First Search algorithm to traverse the Role tree
@@ -786,7 +792,10 @@ func (crm *ConditionalRoleManager) hasLinkHelper(targetName string, roles map[st
 	}
 	nextRoles := map[string]*Role{}
 	for _, role := range roles {
-		if targetName == role.name || (crm.matchingFunc != nil && crm.Match(role.name, targetName)) {
+		if targetName == role.name ||
+			(crm.matchingFunc != nil &&
+				(crm.Match(role.name, targetName) ||
+					(role.isInheritTarget && crm.Match(targetName, role.name)))) {
 			return true
 		}
 		role.rangeRoles(func(key, value interface{}) bool {
